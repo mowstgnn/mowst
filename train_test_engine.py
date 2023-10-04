@@ -1,23 +1,37 @@
-from utils import *
+from utils import (get_model_hyperparameters, 
+                   load_model,
+                   set_random_seed,
+                   save_model,
+                   save_moe_model)
+from typing import List, Tuple, Dict
+import copy
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import wandb
 from sklearn.metrics import roc_auc_score
 from torch.distributions import Categorical
 import pandas as pd
+import scipy.sparse as sp
+import time
+import logging
+from enum import Enum, auto
+import operator
+from torch.nn import Module
+import scipy.sparse.linalg as spla
+from torch_geometric.utils import to_scipy_sparse_matrix
+from model import AdaGCN, SparseMM, GateMLP
 
 
 def get_engine(args, device, data, dataset, split_idx):
-    if args.method == 'vanilla':
+    if args.method == 'baseline':
         engine = BaselineEngine(args, device, data, dataset, split_idx)
-    elif args.method == 'MoWSE':
-        engine = MoWSEEngine(args, device, data, dataset, split_idx)
-    elif args.method == 'SimpleGate':
-        engine = SimpleGate(args, device, data, dataset, split_idx)
-    elif args.method == 'SimpleGateInTurn':
-        engine = SimpleGateInTurn(args, device, data, dataset, split_idx)
+    elif args.method == 'mowst_star':
+        engine = MowstStarEngine(args, device, data, dataset, split_idx)
+    elif args.method == 'mowst':
+        engine = MowstEngine(args, device, data, dataset, split_idx)
 
     return engine
 
@@ -25,14 +39,11 @@ def get_engine(args, device, data, dataset, split_idx):
 class Evaluator(object):
     def __init__(self, name):
         self.name = name
-        if self.name in ['flickr', 'arxiv', "product", 'penn94', 'pokec', 'arxiv-year', 'snap-patents', 'twitch-gamer',
-                         'cora', 'citeseer', 'pubmed']:
+        if self.name in ['flickr', 'arxiv', "product", 'penn94', 'pokec', 'twitch-gamer']:
             self.eval_metric = 'acc'
-        elif self.name in ['ogbn-proteins', 'genius']:
-            self.eval_metric = 'rocauc'
-
+        
     def _parse_and_check_input(self, input_dict):
-        if self.eval_metric == 'rocauc' or self.eval_metric == 'acc' or self.eval_metric == 'acc_ccp':
+        if self.eval_metric == 'acc':
             if not 'y_true' in input_dict:
                 raise RuntimeError('Missing key of y_true')
             if not 'y_pred' in input_dict:
@@ -45,12 +56,7 @@ class Evaluator(object):
         if self.eval_metric == 'acc':
             y_true, y_pred = self._parse_and_check_input(input_dict)
             return self._eval_acc(y_true, y_pred)
-        elif self.eval_metric == 'rocauc':
-            y_true, y_pred = self._parse_and_check_input(input_dict)
-            return self._eval_rocauc(y_true, y_pred)
-        elif self.eval_metric == 'acc_ccp':
-            y_true, y_pred = self._parse_and_check_input(input_dict)
-            return self._eval_acc_ccp(y_true, y_pred)
+    
 
     def _eval_acc(self, y_true, y_pred):
         acc_list = []
@@ -61,46 +67,13 @@ class Evaluator(object):
 
         return sum(acc_list) / len(acc_list)
 
-    def _eval_rocauc(self, y_true, y_pred):
-        '''
-            compute ROC-AUC and AP score averaged across tasks
-        '''
-        rocauc_list = []
-        y_true = y_true.detach().cpu().numpy()
-        if y_true.shape[1] == 1:
-            # use the predicted class for single-class classification
-            y_pred = F.softmax(y_pred, dim=-1)[:, 1].unsqueeze(1).cpu().numpy()
-        else:
-            y_pred = y_pred.detach().cpu().numpy()
-
-        for i in range(y_true.shape[1]):
-            # AUC is only defined when there is at least one positive data.
-            if np.sum(y_true[:, i] == 1) > 0 and np.sum(y_true[:, i] == 0) > 0:
-                is_labeled = y_true[:, i] == y_true[:, i]
-                score = roc_auc_score(y_true[is_labeled, i], y_pred[is_labeled, i])
-
-                rocauc_list.append(score)
-
-        if len(rocauc_list) == 0:
-            raise RuntimeError(
-                'No positively labeled data available. Cannot compute ROC-AUC.')
-
-        return sum(rocauc_list) / len(rocauc_list)
 
 
 def train_vanilla(model, data, crit, optimizer, args):
     model.train()
     optimizer.zero_grad()
     out = model(data)
-
-    if args.dataset in ['ogbn-proteins', 'genius']:
-        if data.y.shape[1] == 1:
-            true_label = F.one_hot(data.y, data.y.max() + 1).squeeze(1)
-        else:
-            true_label = data.y
-        loss = crit(out[data.train_mask], true_label.squeeze(1)[data.train_mask].to(torch.float))
-    else:
-        loss = crit(F.log_softmax(out, dim=1)[data.train_mask], data.y.squeeze(1)[data.train_mask])
+    loss = crit(F.log_softmax(out, dim=1)[data.train_mask], data.y.squeeze(1)[data.train_mask])
     loss.backward()
     optimizer.step()
     return loss.item()
@@ -110,11 +83,7 @@ def train_vanilla(model, data, crit, optimizer, args):
 def test_vanilla(model, data, split_idx, evaluator, args):
     model.eval()
     out = model(data)
-    if args.dataset in ['ogbn-proteins', 'genius']:
-        y_pred = out
-    else:
-        y_pred = out.argmax(dim=-1, keepdim=True)
-
+    y_pred = out.argmax(dim=-1, keepdim=True)
 
     train_acc = evaluator.eval({
         'y_true': data.y[split_idx['train']],
@@ -136,16 +105,7 @@ def test_vanilla(model, data, split_idx, evaluator, args):
 def val_loss_vanilla(model, data, crit, args):
     model.eval()
     out = model(data)
-
-    if args.dataset in ['ogbn-proteins', 'genius']:
-        if data.y.shape[1] == 1:
-            true_label = F.one_hot(data.y, data.y.max() + 1).squeeze(1)
-        else:
-            true_label = data.y
-        loss = crit(out[data.train_mask], true_label.squeeze(1)[data.train_mask].to(torch.float))
-    else:
-        loss = crit(F.log_softmax(out, dim=1)[data.train_mask], data.y.squeeze(1)[data.train_mask])
-
+    loss = crit(F.log_softmax(out, dim=1)[data.train_mask], data.y.squeeze(1)[data.train_mask])
     return loss.item()
 
 
@@ -161,10 +121,9 @@ def vanilla_train_test_wrapper(args, model, data, crit, optimizer, split_idx, ev
         result = test_vanilla(model, data, split_idx, evaluator, args)
 
         if i % args.print_freq == 0:
-            print('{} epochs trained, loss {:.4f}'.format(i, loss))
+            print(f'{i} epochs trained, loss {loss:.4f}')
 
         if args.early_signal == "val_loss":
-            # if result[1] > best_score:
             if val_loss > best_loss:
                 check = 0
                 best_loss = val_loss
@@ -176,9 +135,9 @@ def vanilla_train_test_wrapper(args, model, data, crit, optimizer, split_idx, ev
             else:
                 check += 1
                 if check > args.patience:
-                    print("{} epochs trained, best val loss {:.4f}".format(i, -best_loss))
+                    print(f"{i} epochs trained, best val loss {-best_loss:.4f}")
                     break
-        else:
+        elif args.early_signal == "val_acc":
             if result[1] > best_score:
                 check = 0
                 best_loss = val_loss
@@ -190,30 +149,26 @@ def vanilla_train_test_wrapper(args, model, data, crit, optimizer, split_idx, ev
             else:
                 check += 1
                 if check > args.patience:
-                    print("{} epochs trained, best val acc {:.4f}".format(i, best_score))
+                    print(f"{i} epochs trained, best val acc {best_loss:.4f}")
                     break
+        else:
+            raise ValueError('Invalid early_signal. Choose between val_loss and val_acc')
 
     if (args.early_signal == "val_loss" and best_loss > float('-inf')) or (args.early_signal == "val_acc" and best_score > 0):
         model.load_state_dict(torch.load(saved_model))
     result = test_vanilla(model, data, split_idx, evaluator, args)
     train_acc, val_acc, test_acc, _ = result
-    print('Final results: Train {:.2f} Val {:.2f} Test {:.2f}'.format(train_acc * 100,
-                                                                      val_acc * 100,
-                                                                      test_acc * 100))
+    print(f'Final results: Train {train_acc * 100:.2f} Val {val_acc * 100:.2f} Test {test_acc * 100:.2f}')
     return train_acc, val_acc, test_acc, _, best_loss
 
-from torch.utils.data import TensorDataset, DataLoader
+
 def get_dataloaders(idx, labels, batch_size=None):
-    # labels = torch.LongTensor(labels_np.astype(np.int32))
     if batch_size is None:
         batch_size = max((val.numel() for val in idx.values()))
     datasets = {phase: TensorDataset(ind, labels[ind]) for phase, ind in idx.items()}
     dataloaders = {phase: DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
                    for phase, dataset in datasets.items()}
     return dataloaders
-
-from typing import List, Tuple, Dict
-import copy
 
 
 def exclude_idx(idx: np.ndarray, idx_exclude_list: List[np.ndarray]) -> np.ndarray:
@@ -253,7 +208,6 @@ def gen_splits(
         val_idx = exclude_idx(known_idx, [train_idx, stopping_idx])
     return train_idx, stopping_idx, val_idx
 
-import scipy.sparse as sp
 
 def calc_A_hat(adj_matrix: sp.spmatrix) -> sp.spmatrix:
     nnodes = adj_matrix.shape[0]
@@ -272,12 +226,6 @@ def sparse_matrix_to_torch(X):
             coo.shape)
 
 
-
-import time
-import logging
-
-
-from enum import Enum, auto
 class StopVariable(Enum):
     LOSS = auto()
     ACCURACY = auto()
@@ -286,8 +234,7 @@ class StopVariable(Enum):
 class Best(Enum):
     RANKED = auto()
     ALL = auto()
-import operator
-from torch.nn import Module
+
 class EarlyStopping:
     def __init__(
             self, model: Module, stop_varnames: List[StopVariable],
@@ -339,7 +286,7 @@ class EarlyStopping:
             self.patience -= 1
         return self.patience == 0
 
-import scipy.sparse.linalg as spla
+
 def normalize_attributes(attr_matrix):
     epsilon = 1e-12
     if isinstance(attr_matrix, sp.csr_matrix):
@@ -353,7 +300,6 @@ def normalize_attributes(attr_matrix):
     return attr_mat_norm
 
 
-from torch_geometric.utils import to_scipy_sparse_matrix
 def vanilla_ori_adagcn_wrapper(args, model, dataset, data, optimizer, split_idx, device):
     model_args = {
         'hiddenunits': [64],
@@ -440,7 +386,6 @@ def vanilla_ori_adagcn_wrapper(args, model, dataset, data, optimizer, split_idx,
 
                         # Collect statistics
                         running_loss += loss.item()
-                        # running_loss += loss.item() * idx.size(0)
                         running_corrects += torch.sum(preds == labels)
 
                 # Collect statistics (current epoch)
@@ -479,19 +424,13 @@ def vanilla_ori_adagcn_wrapper(args, model, dataset, data, optimizer, split_idx,
         logging.log(22, f"Last epoch: {epoch}, best epoch: {early_stopping.best_epoch} ({runtime:.3f} sec)")
         print(f"Last epoch: {epoch}, ({runtime:.3f} sec)")
         # Load best model weights
-
-        # model.load_state_dict(torch.load(saved_model))
         model.load_state_dict(early_stopping.best_state)
         model.eval()
-        # output = model(features, adj)[torch.arange(graph.adj_matrix.shape[0])].detach()
         output = model(features, adj)[torch.arange(adj.shape[0])].detach()
         output_logp = torch.log(F.softmax(output, dim=1))
         h = (nclasses - 1) * (output_logp - torch.mean(output_logp, dim=1).view(-1, 1))
         results += h
-        # adjust weights
-        # temp = F.nll_loss(output_logp[idx_all['train']],
-        #                   torch.LongTensor(labels_all[idx_all['train']].astype(np.int32)).to(device),
-        #                   reduction='none')  # 140*1
+        
         temp = F.nll_loss(output_logp[split_idx['train']],
                           torch.LongTensor(labels_all[split_idx['train']]).to(device),
                           reduction='none')  # 140*1
@@ -504,8 +443,6 @@ def vanilla_ori_adagcn_wrapper(args, model, dataset, data, optimizer, split_idx,
 
     # (5) evaluate the best model from early stopping on test set
     runtime = time.time() - start_time
-    # stopping_preds = torch.argmax(results[idx_all['stopping']], dim=1).cpu().numpy()
-    # stopping_acc = (stopping_preds == labels_all[idx_all['stopping']]).mean()
 
     train_preds = torch.argmax(results[split_idx['train']], dim=1).cpu()
     train_acc = (train_preds == labels_all[split_idx['train']]).float().mean()
@@ -515,8 +452,6 @@ def vanilla_ori_adagcn_wrapper(args, model, dataset, data, optimizer, split_idx,
     logging.log(21, f"Early stopping accuracy: {stopping_acc * 100:.1f}%")
     print(f"Early stopping accuracy: {stopping_acc * 100:.1f}%")
 
-    # valtest_preds = torch.argmax(results[idx_all['valtest']], dim=1).cpu().numpy()
-    # valtest_acc = (valtest_preds == labels_all[idx_all['valtest']]).mean()
     valtest_preds = torch.argmax(results[split_idx['test']], dim=1).cpu()
     valtest_acc = (valtest_preds == labels_all[split_idx['test']]).float().mean()
 
@@ -535,33 +470,12 @@ def vanilla_ori_adagcn_wrapper(args, model, dataset, data, optimizer, split_idx,
     valid_acc = float(stopping_acc)
     test_acc = float(valtest_acc)
 
-
-
-    print('Final results: Train {:.2f} Val {:.2f} Test {:.2f}'.format(train_acc * 100,
-                                                                      valid_acc * 100,
-                                                                      test_acc * 100))
-
-
-
-
+    print(f'Final results: Train {train_acc * 100:.2f} Val {valid_acc * 100:.2f} Test {test_acc * 100:.2f}')
 
     return train_acc, valid_acc, test_acc, float(0), float(0)
 
-# deprecated
-# def compute_confidence(args, x):
-#     n = x.shape[1]
-#     if args.confidence == 'variance':
-#         out = nn.Softmax(1)(x)
-#         variance = torch.var(out, dim=1, unbiased=False)
-#         zero_tensor = torch.zeros(n)
-#         zero_tensor[0] = 1
-#         max_variance = torch.var(zero_tensor, unbiased=False)
-#         # var = (out - 1 / n) ** 2 / n
-#         # conf = (var.sum(1) * (n ** 2 / (n - 1)))
-#     return variance / max_variance
 
-
-# @torch.no_grad()
+@torch.no_grad()
 def compute_confidence(logit, method):
     n_classes = logit.shape[1]
     logit = nn.Softmax(1)(logit)
@@ -579,128 +493,7 @@ def compute_confidence(logit, method):
     return res.view(-1, 1)
 
 
-def mowse_train_test_wrapper(args, model1, model2, data, crit, optimizer1, optimizer2, split_idx, evaluator, device):
-    big_epoch_check = 0
-    big_best_score = 0
-
-    for j in range(args.big_epoch):
-        print('------ Big epoch {} Model 1 ------'.format(j))
-        model1_turn_val_acc = mowse_train_test_model1_turn_wrapper(args, model1, model2, data, crit, optimizer1,
-                                                                   split_idx, evaluator, device, big_best_score)
-        print('------ Big epoch {} Model 2 ------'.format(j))
-        mowse_train_test_model2_turn_wrapper(args, model1, model2, data, crit, optimizer2, split_idx, evaluator, device,
-                                             model1_turn_val_acc)
-        result = test_mowse(model1, model2, data, split_idx, evaluator, args, device, False)
-
-        if args.log:
-            wandb.log({'Train Acc': result[0],
-                       'Val Acc': result[1],
-                       'Test Acc': result[2],
-                       'Confidence': get_cur_confidence(args, model1, data).mean().item()})
-        if result[1] > big_best_score:
-            big_epoch_check = 0
-            big_best_score = result[1]
-            saved_model1_big = save_moe_model(args, model1, '1_big')
-            saved_model2_big = save_moe_model(args, model2, '2_big')
-        else:
-            big_epoch_check += 1
-            if big_epoch_check > args.big_patience:
-                print("{} big epochs trained, best val accuracy {:.4f}".format(j, big_best_score))
-                break
-
-    model1.load_state_dict(torch.load(saved_model1_big))
-    model2.load_state_dict(torch.load(saved_model2_big))
-    result = test_mowse(model1, model2, data, split_idx, evaluator, args, device, True)
-    train_acc, val_acc, test_acc = result
-    print('{} big epochs trained, Train {:.2f} Val {:.2f} Test {:.2f}'.format(j, train_acc * 100,
-                                                                              val_acc * 100,
-                                                                              test_acc * 100))
-    return result
-
-
-def mowse_train_test_model1_turn_wrapper(args, model1, model2, data, crit, optimizer1, split_idx, evaluator, device,
-                                         big_best_score):
-    if not args.no_save_all_time:
-        saved_model1_previous_big_turn = save_moe_model(args, model1, '1_big')
-        saved_model2_previous_big_turn = save_moe_model(args, model2, '2_big')
-
-    check = 0
-    best_score = 0
-    for i in range(args.epoch):
-
-        loss = train_mowse1(model1, model2, data, crit, optimizer1, args)
-        result = test_mowse(model1, model2, data, split_idx, evaluator, args, device, False)
-
-        if i % args.print_freq == 0:
-            print('{} epochs trained, loss {:.4f}'.format(i, loss))
-
-        if result[1] > best_score:
-            check = 0
-            best_score = result[1]
-            saved_model1 = save_moe_model(args, model1, '1_inner')
-            saved_model2 = save_moe_model(args, model2, '2_inner')
-        else:
-            check += 1
-            if check > args.patience:
-                print("{} epochs trained, best val accuracy {:.2f}".format(i, best_score * 100))
-                break
-    if not args.no_save_all_time:
-        if best_score > big_best_score:
-            model1.load_state_dict(torch.load(saved_model1))
-            model2.load_state_dict(torch.load(saved_model2))
-        else:
-            model1.load_state_dict(torch.load(saved_model1_previous_big_turn))
-            model2.load_state_dict(torch.load(saved_model2_previous_big_turn))
-        saved_model1 = save_moe_model(args, model1, 1)
-        saved_model2 = save_moe_model(args, model2, 2)
-        return max(best_score, big_best_score)
-    else:
-        model1.load_state_dict(torch.load(saved_model1))
-        model2.load_state_dict(torch.load(saved_model2))
-        return best_score
-
-
-def mowse_train_test_model2_turn_wrapper(args, model1, model2, data, crit, optimizer2, split_idx, evaluator, device,
-                                         model1_turn_val_acc):
-    if not args.no_save_all_time:
-        saved_model1_previous_small_turn = save_moe_model(args, model1, 1)
-        saved_model2_previous_small_turn = save_moe_model(args, model2, 2)
-
-    check = 0
-    best_score = 0
-    for i in range(args.epoch):
-
-        loss = train_mowse2(model1, model2, data, crit, optimizer2, args)
-        result = test_mowse(model1, model2, data, split_idx, evaluator, args, device, False)
-
-        if i % args.print_freq == 0:
-            print('{} epochs trained, loss {:.4f}'.format(i, loss))
-
-        if result[1] > best_score:
-            check = 0
-            best_score = result[1]
-            saved_model1 = save_moe_model(args, model1, '1_inner')
-            saved_model2 = save_moe_model(args, model2, '2_inner')
-        else:
-            check += 1
-            if check > args.patience:
-                print("{} epochs trained, best val accuracy {:.2f}".format(i, best_score * 100))
-                break
-    if not args.no_save_all_time:
-        if best_score > model1_turn_val_acc:
-            model1.load_state_dict(torch.load(saved_model1))
-            model2.load_state_dict(torch.load(saved_model2))
-        else:
-            model1.load_state_dict(torch.load(saved_model1_previous_small_turn))
-            model2.load_state_dict(torch.load(saved_model2_previous_small_turn))
-        saved_model1 = save_moe_model(args, model1, 1)
-        saved_model2 = save_moe_model(args, model2, 2)
-    else:
-        model1.load_state_dict(torch.load(saved_model1))
-        model2.load_state_dict(torch.load(saved_model2))
-
-
-def train_mowse1(model1, model2, data, crit, optimizer1, args):
+def train_mowst1(model1, model2, data, crit, optimizer1, args):
     model1.train()
     model2.eval()
     optimizer1.zero_grad()
@@ -731,7 +524,7 @@ def train_mowse1(model1, model2, data, crit, optimizer1, args):
     return loss.mean().item()
 
 
-def train_mowse2(model1, model2, data, crit, optimizer2, args):
+def train_mowst2(model1, model2, data, crit, optimizer2, args):
     model1.eval()
     model2.train()
     optimizer2.zero_grad()
@@ -764,7 +557,7 @@ def train_mowse2(model1, model2, data, crit, optimizer2, args):
 
 
 @torch.no_grad()
-def test_mowse(model1, model2, data, split_idx, evaluator, args, device, check_g_dist):
+def test_mowst(model1, model2, data, split_idx, evaluator, args, device, check_g_dist):
     model1.eval()
     model2.eval()
     if args.confidence == 'variance':
@@ -811,7 +604,7 @@ def test_mowse(model1, model2, data, split_idx, evaluator, args, device, check_g
     if check_g_dist:
         gate = gate.view(-1)
         model1_percent = gate.sum().item() / len(gate) * 100
-        print('Model1 / Model2: {:.2f} / {:.2f}'.format(model1_percent, 100 - model1_percent))
+        print(f'Model1 / Model2: {model1_percent:.2f} / {100 - model1_percent:.2f}')
 
     return train_acc, valid_acc, test_acc
 
@@ -847,13 +640,12 @@ class BaselineEngine(object):
 
     def initialize(self, seed):
         set_random_seed(seed)
-        if self.args.dataset in ['genius', 'ogbn-genius']:
-            self.crit = nn.BCEWithLogitsLoss()
-        else:
-            self.crit = nn.NLLLoss()
+
+        self.crit = nn.NLLLoss()
         if self.args.adam:
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr,
-                                              weight_decay=self.args.weight_decay)
+            self.optimizer = torch.optim.Adam(
+                self.model.parameters(), lr=self.args.lr,
+                weight_decay=self.args.weight_decay)
         else:
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(), lr=self.args.lr,
@@ -863,71 +655,20 @@ class BaselineEngine(object):
         self.initialize(seed)
         self.model.reset_parameters()
         if self.args.model2 == "adagcn":
-
-            result = vanilla_ori_adagcn_wrapper(self.args, self.model, self.dataset,
-                                                self.data, self.optimizer, self.split_idx, self.device)
+            result = vanilla_ori_adagcn_wrapper(
+                self.args, self.model, self.dataset,
+                self.split_idx, self.device)
         else:
 
-            result = vanilla_train_test_wrapper(self.args, self.model, self.data, self.crit, self.optimizer, self.split_idx,
-                                                self.evaluator)
+            result = vanilla_train_test_wrapper(
+                self.args, self.model, self.data, 
+                self.crit, self.optimizer, 
+                self.split_idx, self.evaluator)
         return result
 
 
-class MoWSEEngine(object):
-    def __init__(self, args, device, data, dataset, split_idx):
-        self.args = args
-        self.device = device
-        self.data = data.to(self.device)
-        model1_hyper, model2_hyper = get_model_hyperparameters(args, data, dataset)
-        input_dim, hidden_dim1, output_dim, num_layers1 = model1_hyper
-        input_dim, hidden_dim2, output_dim, num_layers2 = model2_hyper
-        dropout = args.dropout
-        if args.confidence == 'learnable':
-            self.model1 = load_model(args.model1 + 'Learn', input_dim, hidden_dim1, output_dim, num_layers1,
-                                     dropout).to(self.device)
-        else:
-            self.model1 = load_model(args.model1, input_dim, hidden_dim1, output_dim, num_layers1, dropout).to(
-                self.device)
-        self.model2 = load_model(args.model2, input_dim, hidden_dim2, output_dim, num_layers2, dropout).to(self.device)
 
-        self.split_idx = split_idx
-        self.evaluator = Evaluator(args.dataset)
-
-    def initialize(self, seed):
-        set_random_seed(seed)
-        if self.args.dataset in ['genius', 'ogbn-genius']:
-            self.crit = nn.BCEWithLogitsLoss(reduction='none')
-            self.crit_pretrain = nn.BCEWithLogitsLoss()
-        else:
-            self.crit = nn.NLLLoss(reduction='none')
-            self.crit_pretrain = nn.NLLLoss()
-
-        if self.args.optim == 'adam':
-            self.optimizer1 = torch.optim.Adam(self.model1.parameters(), lr=self.args.lr,
-                                               weight_decay=self.args.weight_decay)
-            self.optimizer2 = torch.optim.Adam(self.model2.parameters(), lr=self.args.lr,
-                                               weight_decay=self.args.weight_decay)
-
-    def run_model(self, seed):
-        self.initialize(seed)
-        self.model1.reset_parameters()
-        self.model2.reset_parameters()
-
-        if self.args.pretrain == True:
-            result1 = vanilla_train_test_wrapper(self.args, self.model1, self.data, self.crit_pretrain,
-                                                 self.optimizer1, self.split_idx, self.evaluator)
-            result2 = vanilla_train_test_wrapper(self.args, self.model2, self.data, self.crit_pretrain,
-                                                 self.optimizer2, self.split_idx, self.evaluator)
-            print('Model pretraining done')
-
-        result = mowse_train_test_wrapper(self.args, self.model1, self.model2, self.data, self.crit,
-                                          self.optimizer1, self.optimizer2,
-                                          self.split_idx, self.evaluator, self.device)
-
-        return result1, result2, result
-
-
-class SimpleGate(object):
+class MowstStarEngine(object):
     def __init__(self, args, device, data, dataset, split_idx):
         self.args = args
         self.device = device
@@ -942,66 +683,51 @@ class SimpleGate(object):
         self.model2 = load_model(args.model2, input_dim, hidden_dim2, output_dim, num_layers2, dropout, args).to(
             self.device)
 
-        if args.biased == "logit":
-            if args.original_data == "true":
-                self.gate_model = GateMLP(input_dim + output_dim, hidden_dim1, 1, num_layers1, dropout, args).to(
-                    self.device)
-            elif args.original_data == "false":
-                self.gate_model = GateMLP(output_dim, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
-        elif args.biased == "dispersion":
-            if args.original_data == "true":
-                self.gate_model = GateMLP(input_dim + 2, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
-            elif args.original_data == "false":
-                self.gate_model = GateMLP(2, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
-            elif args.original_data == "hypermlp":
-                self.para1_model = GateMLP(in_channels=input_dim,
-                                           hidden_channels=args.hyper_hidden,
-                                           out_channels=2 * args.model1_hidden_dim,
-                                           num_layers=args.hyper_num_layers,
-                                           dropout=0.5, args=args).to(self.device)
-                self.parabias1_model = GateMLP(in_channels=input_dim,
-                                               hidden_channels=args.hyper_hidden,
-                                               out_channels=args.model1_hidden_dim,
-                                               num_layers=args.hyper_num_layers,
-                                               dropout=0.5, args=args).to(self.device)
-                self.para2_model = GateMLP(in_channels=input_dim,
-                                           hidden_channels=args.hyper_hidden,
-                                           out_channels=args.model1_hidden_dim,
-                                           num_layers=args.hyper_num_layers,
-                                           dropout=0.5, args=args).to(self.device)
-                self.parabias2_model = GateMLP(in_channels=input_dim,
-                                               hidden_channels=args.hyper_hidden,
-                                               out_channels=1,
-                                               num_layers=args.hyper_num_layers,
-                                               dropout=0.5, args=args).to(self.device)
-                self.gate_model = [self.para1_model, self.parabias1_model, self.para2_model, self.parabias2_model]
-            elif args.original_data == "hypergcn":
-                pass
-        elif args.biased == "none":
-            self.gate_model = MLP(input_dim, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
+        
+        
+        if args.original_data == "true":
+            self.gate_model = GateMLP(input_dim + 2, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
+        elif args.original_data == "false":
+            self.gate_model = GateMLP(2, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
+        elif args.original_data == "hypermlp":
+            self.para1_model = GateMLP(in_channels=input_dim,
+                                        hidden_channels=args.hyper_hidden,
+                                        out_channels=2 * args.model1_hidden_dim,
+                                        num_layers=args.hyper_num_layers,
+                                        dropout=0.5, args=args).to(self.device)
+            self.parabias1_model = GateMLP(in_channels=input_dim,
+                                            hidden_channels=args.hyper_hidden,
+                                            out_channels=args.model1_hidden_dim,
+                                            num_layers=args.hyper_num_layers,
+                                            dropout=0.5, args=args).to(self.device)
+            self.para2_model = GateMLP(in_channels=input_dim,
+                                        hidden_channels=args.hyper_hidden,
+                                        out_channels=args.model1_hidden_dim,
+                                        num_layers=args.hyper_num_layers,
+                                        dropout=0.5, args=args).to(self.device)
+            self.parabias2_model = GateMLP(in_channels=input_dim,
+                                            hidden_channels=args.hyper_hidden,
+                                            out_channels=1,
+                                            num_layers=args.hyper_num_layers,
+                                            dropout=0.5, args=args).to(self.device)
+            self.gate_model = [self.para1_model, self.parabias1_model, self.para2_model, self.parabias2_model]
+        elif args.original_data == "hypergcn":
+            pass
+        
 
         self.split_idx = split_idx
         self.evaluator = Evaluator(args.dataset)
 
     def initialize(self, seed):
         set_random_seed(seed)
-        if self.args.subloss == 'loss_combine':
-            if self.args.dataset in ['genius', 'ogbn-genius']:
-                self.crit = nn.BCEWithLogitsLoss(reduction='none')
-                self.crit_pretrain = nn.BCEWithLogitsLoss()
-            else:
-                self.args.crit = 'nllloss'
-                self.crit = nn.NLLLoss(reduction='none')
-                self.crit_pretrain = nn.NLLLoss()
-        elif self.args.subloss == 'combine_loss':
-            if self.args.dataset in ['genius', 'ogbn-genius']:
-                self.crit = nn.BCEWithLogitsLoss()
-                self.crit_pretrain = nn.BCEWithLogitsLoss()
-            else:
-                self.args.crit = 'crossentropy'
-                self.crit = nn.CrossEntropyLoss()
-                self.crit_pretrain = nn.CrossEntropyLoss()
-
+        if self.args.subloss == 'separate':
+            self.args.crit = 'nllloss'
+            self.crit = nn.NLLLoss(reduction='none')
+            self.crit_pretrain = nn.NLLLoss()
+        elif self.args.subloss == 'joint':
+            self.args.crit = 'crossentropy'
+            self.crit = nn.CrossEntropyLoss()
+            self.crit_pretrain = nn.CrossEntropyLoss()
         if self.args.adam:
             if self.args.original_data != "hypermlp":
                 self.optimizer = torch.optim.Adam(
@@ -1087,7 +813,7 @@ class SimpleGate(object):
         return result
 
 
-class SimpleGateInTurn(object):
+class MowstEngine(object):
     def __init__(self, args, device, data, dataset, split_idx):
 
         self.args = args
@@ -1103,56 +829,43 @@ class SimpleGateInTurn(object):
         self.model2 = load_model(args.model2, input_dim, hidden_dim2, output_dim, num_layers2, dropout, args).to(
             self.device)
 
-        if args.biased == "logit":
-            if args.original_data == "true":
-                self.gate_model = GateMLP(input_dim + output_dim, hidden_dim1, 1, num_layers1, dropout, args).to(
-                    self.device)
-            elif args.original_data == "false":
-                self.gate_model = GateMLP(output_dim, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
-        elif args.biased == "dispersion":
-            if args.original_data == "true":
-                self.gate_model = GateMLP(input_dim + 2, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
-            elif args.original_data == "false":
-                self.gate_model = GateMLP(2, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
-            elif args.original_data == "hypermlp":
-                self.para1_model = GateMLP(in_channels=input_dim,
-                                           hidden_channels=args.hyper_hidden,
-                                           out_channels=2 * args.model1_hidden_dim,
-                                           num_layers=args.hyper_num_layers,
-                                           dropout=0.5, args=args).to(self.device)
-                self.parabias1_model = GateMLP(in_channels=input_dim,
-                                               hidden_channels=args.hyper_hidden,
-                                               out_channels=args.model1_hidden_dim,
-                                               num_layers=args.hyper_num_layers,
-                                               dropout=0.5, args=args).to(self.device)
-                self.para2_model = GateMLP(in_channels=input_dim,
-                                           hidden_channels=args.hyper_hidden,
-                                           out_channels=args.model1_hidden_dim,
-                                           num_layers=args.hyper_num_layers,
-                                           dropout=0.5, args=args).to(self.device)
-                self.parabias2_model = GateMLP(in_channels=input_dim,
-                                               hidden_channels=args.hyper_hidden,
-                                               out_channels=1,
-                                               num_layers=args.hyper_num_layers,
-                                               dropout=0.5, args=args).to(self.device)
-                self.gate_model = [self.para1_model, self.parabias1_model, self.para2_model, self.parabias2_model]
-        elif args.biased == "none":
-            self.gate_model = MLP(input_dim, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
+        if args.original_data == "true":
+            self.gate_model = GateMLP(input_dim + 2, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
+        elif args.original_data == "false":
+            self.gate_model = GateMLP(2, hidden_dim1, 1, num_layers1, dropout, args).to(self.device)
+        elif args.original_data == "hypermlp":
+            self.para1_model = GateMLP(in_channels=input_dim,
+                                        hidden_channels=args.hyper_hidden,
+                                        out_channels=2 * args.model1_hidden_dim,
+                                        num_layers=args.hyper_num_layers,
+                                        dropout=0.5, args=args).to(self.device)
+            self.parabias1_model = GateMLP(in_channels=input_dim,
+                                            hidden_channels=args.hyper_hidden,
+                                            out_channels=args.model1_hidden_dim,
+                                            num_layers=args.hyper_num_layers,
+                                            dropout=0.5, args=args).to(self.device)
+            self.para2_model = GateMLP(in_channels=input_dim,
+                                        hidden_channels=args.hyper_hidden,
+                                        out_channels=args.model1_hidden_dim,
+                                        num_layers=args.hyper_num_layers,
+                                        dropout=0.5, args=args).to(self.device)
+            self.parabias2_model = GateMLP(in_channels=input_dim,
+                                            hidden_channels=args.hyper_hidden,
+                                            out_channels=1,
+                                            num_layers=args.hyper_num_layers,
+                                            dropout=0.5, args=args).to(self.device)
+            self.gate_model = [self.para1_model, self.parabias1_model, self.para2_model, self.parabias2_model]
+        
         self.split_idx = split_idx
         self.evaluator = Evaluator(args.dataset)
 
     def initialize(self, seed):
         set_random_seed(seed)
-
-        if self.args.dataset in ['genius', 'ogbn-genius']:
-            self.crit = nn.BCEWithLogitsLoss(reduction='none')
-            self.crit_pretrain = nn.BCEWithLogitsLoss()
+        if self.args.crit == 'nllloss':
+            self.crit = nn.NLLLoss(reduction='none')
+            self.crit_pretrain = nn.NLLLoss()
         else:
-            if self.args.crit == 'nllloss':
-                self.crit = nn.NLLLoss(reduction='none')
-                self.crit_pretrain = nn.NLLLoss()
-            else:
-                raise ValueError('Invalid Crit. In In Turn setting, only NLLLoss can be used')
+            raise ValueError('Invalid Crit. In In Turn setting, only NLLLoss can be used')
 
         if self.args.adam:
             if self.args.original_data != "hypermlp":
@@ -1222,7 +935,7 @@ class SimpleGateInTurn(object):
         self.model2.dropout = self.args.dropout_gate
         if self.args.original_data != "hypermlp":
             self.gate_model.dropout = self.args.dropout_gate
-        result = mowse_train_test_wrapper_simple_gate(self.args, self.model1, self.model2, self.gate_model, self.data,
+        result = mowst_train_test_wrapper_simple_gate(self.args, self.model1, self.model2, self.gate_model, self.data,
                                                       self.crit,
                                                       self.optimizer1, self.optimizer2,
                                                       self.split_idx, self.evaluator, self.device)
@@ -1246,50 +959,41 @@ def train_simple_gate(model1, model2, gate_model, data, crit, optimizer, args):
 
     model1_out = model1(data)
     model2_out = model2(data)
-    if args.biased == 'logit':
-        if args.original_data == "true":
-            x = torch.cat((model1_out, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(x))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(model1_out))
-    elif args.biased == 'dispersion':
-        var_conf = compute_confidence(model1_out, "variance")
-        ent_conf = compute_confidence(model1_out, "entropy")
-        dispersion = torch.cat((var_conf, ent_conf), dim=1)
-        if args.original_data == "true":
-            gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(gate_input))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(dispersion))
-        elif args.original_data == "hypermlp":
-            node_feature = data.mlp_x
-            para1 = para1_model(node_feature)
-            parabias1 = parabias1_model(node_feature)
-            para2 = para2_model(node_feature)
-            parabias2 = parabias2_model(node_feature)
+    
+    var_conf = compute_confidence(model1_out, "variance")
+    ent_conf = compute_confidence(model1_out, "entropy")
+    dispersion = torch.cat((var_conf, ent_conf), dim=1)
+    if args.original_data == "true":
+        gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
+        gating = nn.Sigmoid()(gate_model(gate_input))
+    elif args.original_data == "false":
+        gating = nn.Sigmoid()(gate_model(dispersion))
+    elif args.original_data == "hypermlp":
+        node_feature = data.mlp_x
+        para1 = para1_model(node_feature)
+        parabias1 = parabias1_model(node_feature)
+        para2 = para2_model(node_feature)
+        parabias2 = parabias2_model(node_feature)
 
-            para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
-            dispersion = dispersion[:, np.newaxis, :]
-            para2 = para2[:, :, np.newaxis]
+        para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
+        dispersion = dispersion[:, np.newaxis, :]
+        para2 = para2[:, :, np.newaxis]
 
-            gating = torch.matmul(dispersion, para1)
-            gating += parabias1[:, np.newaxis, :]
-            gating = torch.matmul(gating, para2)
-            gating += parabias2[:, np.newaxis, :]
-            gating = nn.Sigmoid()(gating).view(-1, 1)
+        gating = torch.matmul(dispersion, para1)
+        gating += parabias1[:, np.newaxis, :]
+        gating = torch.matmul(gating, para2)
+        gating += parabias2[:, np.newaxis, :]
+        gating = nn.Sigmoid()(gating).view(-1, 1)
 
 
-    elif args.biased == 'none':
-        gating = nn.Sigmoid()(gate_model(data))
-
-    if args.subloss == 'combine_loss':
+    if args.subloss == 'joint':
         # out = F.softmax(model1_out, dim = 1) * gating + F.softmax(model2_out, dim = 1) * (1 - gating)
         out = model1_out * gating + model2_out * (1 - gating)
         loss = crit(out[data.train_mask], data.y.squeeze(1)[data.train_mask])
         loss.backward()
         optimizer.step()
         return loss.item()
-    elif args.subloss == 'loss_combine':
+    elif args.subloss == 'separate':
         if crit.__class__.__name__ == 'NLLLoss':
             loss1 = crit(F.log_softmax(model1_out, dim=1)[data.train_mask], data.y.squeeze(1)[data.train_mask])
             loss2 = crit(F.log_softmax(model2_out, dim=1)[data.train_mask], data.y.squeeze(1)[data.train_mask])
@@ -1379,41 +1083,34 @@ def test_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, arg
         parabias2_model.eval()
     model1_out = F.softmax(model1(data), dim=1)
     model2_out = F.softmax(model2(data), dim=1)
-    if args.biased == 'logit':
-        if args.original_data == "true":
-            x = torch.cat((model1_out, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(x))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(model1_out))
-    elif args.biased == 'dispersion':
-        var_conf = compute_confidence(model1_out, "variance")
-        ent_conf = compute_confidence(model1_out, "entropy")
-        dispersion = torch.cat((var_conf, ent_conf), dim=1)
-        if args.original_data == "true":
-            gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(gate_input))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(dispersion))
-        elif args.original_data == "hypermlp":
-            node_feature = data.mlp_x
-            para1 = para1_model(node_feature)
-            parabias1 = parabias1_model(node_feature)
-            para2 = para2_model(node_feature)
-            parabias2 = parabias2_model(node_feature)
+    
 
-            para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
-            dispersion = dispersion[:, np.newaxis, :]
-            para2 = para2[:, :, np.newaxis]
+    var_conf = compute_confidence(model1_out, "variance")
+    ent_conf = compute_confidence(model1_out, "entropy")
+    dispersion = torch.cat((var_conf, ent_conf), dim=1)
+    if args.original_data == "true":
+        gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
+        gating = nn.Sigmoid()(gate_model(gate_input))
+    elif args.original_data == "false":
+        gating = nn.Sigmoid()(gate_model(dispersion))
+    elif args.original_data == "hypermlp":
+        node_feature = data.mlp_x
+        para1 = para1_model(node_feature)
+        parabias1 = parabias1_model(node_feature)
+        para2 = para2_model(node_feature)
+        parabias2 = parabias2_model(node_feature)
 
-            gating = torch.matmul(dispersion, para1)
-            gating += parabias1[:, np.newaxis, :]
-            gating = torch.matmul(gating, para2)
-            gating += parabias2[:, np.newaxis, :]
-            gating = nn.Sigmoid()(gating).view(-1, 1)
-    elif args.biased == 'none':
-        gating = nn.Sigmoid()(gate_model(data))
+        para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
+        dispersion = dispersion[:, np.newaxis, :]
+        para2 = para2[:, :, np.newaxis]
 
-    if args.infer_method == 'simple':
+        gating = torch.matmul(dispersion, para1)
+        gating += parabias1[:, np.newaxis, :]
+        gating = torch.matmul(gating, para2)
+        gating += parabias2[:, np.newaxis, :]
+        gating = nn.Sigmoid()(gating).view(-1, 1)
+
+    if args.infer_method == 'joint':
         train_acc, valid_acc, test_acc, model1_weight = eval_for_simplicity(evaluator, data, model1_out, model2_out,
                                                                             gating, split_idx, args)
         return train_acc, valid_acc, test_acc, model1_weight
@@ -1452,10 +1149,10 @@ def simple_gate_train_test_wrapper(args, model1, model2, gate_model, data, crit,
                        'L2': l2})
 
         if i % args.print_freq == 0:
-            print('{} epochs trained, loss {:.4f}'.format(i, loss))
+            print(f'{i} epochs trained, loss {loss:.4f}')
 
         if args.no_early_stop is False:
-            # if result[1] > best_score:
+
             if val_loss > best_loss:
                 check = 0
                 best_score = result[1]
@@ -1473,10 +1170,9 @@ def simple_gate_train_test_wrapper(args, model1, model2, gate_model, data, crit,
             else:
                 check += 1
                 if check > args.patience:
-                    print("{} epochs trained, best val loss {:.4f}".format(i, -best_loss))
+                    print(f"{i} epochs trained, best val loss {-best_loss:.4f}")
                     break
         else:
-            # if result[1] > best_score:
             if val_loss > best_loss:
                 check = 0
                 best_score = result[1]
@@ -1505,10 +1201,7 @@ def simple_gate_train_test_wrapper(args, model1, model2, gate_model, data, crit,
 
     result = test_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device)
     train_acc, val_acc, test_acc, model1_weight = result
-    print('Final results: Train {:.2f} Val {:.2f} Test {:.2f} Model1 Weight {:.2f}'.format(train_acc * 100,
-                                                                                           val_acc * 100,
-                                                                                           test_acc * 100,
-                                                                                           model1_weight * 100))
+    print(f'Final results: Train {train_acc * 100:.2f} Val {val_acc * 100:.2f} Test {test_acc * 100:.2f} Model1 Weight {model1_weight * 100:.2f}')
 
     return train_acc, val_acc, test_acc, model1_weight, best_loss
 
@@ -1528,48 +1221,41 @@ def cal_val_loss_simple_gate(model1, model2, gate_model, data, crit, args):
 
     model1_out = model1(data)
     model2_out = model2(data)
-    if args.biased == 'logit':
-        if args.original_data == "true":
-            x = torch.cat((model1_out, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(x))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(model1_out))
-    elif args.biased == 'dispersion':
-        var_conf = compute_confidence(model1_out, "variance")
-        ent_conf = compute_confidence(model1_out, "entropy")
-        dispersion = torch.cat((var_conf, ent_conf), dim=1)
-        if args.original_data == "true":
-            gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(gate_input))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(dispersion))
-        elif args.original_data == "hypermlp":
-            node_feature = data.mlp_x
-            para1 = para1_model(node_feature)
-            parabias1 = parabias1_model(node_feature)
-            para2 = para2_model(node_feature)
-            parabias2 = parabias2_model(node_feature)
+    
+    
+    var_conf = compute_confidence(model1_out, "variance")
+    ent_conf = compute_confidence(model1_out, "entropy")
+    dispersion = torch.cat((var_conf, ent_conf), dim=1)
+    if args.original_data == "true":
+        gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
+        gating = nn.Sigmoid()(gate_model(gate_input))
+    elif args.original_data == "false":
+        gating = nn.Sigmoid()(gate_model(dispersion))
+    elif args.original_data == "hypermlp":
+        node_feature = data.mlp_x
+        para1 = para1_model(node_feature)
+        parabias1 = parabias1_model(node_feature)
+        para2 = para2_model(node_feature)
+        parabias2 = parabias2_model(node_feature)
 
-            para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
-            dispersion = dispersion[:, np.newaxis, :]
-            para2 = para2[:, :, np.newaxis]
+        para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
+        dispersion = dispersion[:, np.newaxis, :]
+        para2 = para2[:, :, np.newaxis]
 
-            gating = torch.matmul(dispersion, para1)
-            gating += parabias1[:, np.newaxis, :]
-            gating = torch.matmul(gating, para2)
-            gating += parabias2[:, np.newaxis, :]
-            gating = nn.Sigmoid()(gating).view(-1, 1)
+        gating = torch.matmul(dispersion, para1)
+        gating += parabias1[:, np.newaxis, :]
+        gating = torch.matmul(gating, para2)
+        gating += parabias2[:, np.newaxis, :]
+        gating = nn.Sigmoid()(gating).view(-1, 1)
 
-    elif args.biased == 'none':
-        gating = nn.Sigmoid()(gate_model(data))
 
     loss1 = crit(F.log_softmax(model1_out, dim=1)[data.val_mask], data.y.squeeze(1)[data.val_mask])
     loss2 = crit(F.log_softmax(model2_out, dim=1)[data.val_mask], data.y.squeeze(1)[data.val_mask])
-    if args.subloss == 'combine_loss':
+    if args.subloss == 'joint':
         out = model1_out * gating + model2_out * (1 - gating)
         loss = crit(F.log_softmax(out, dim=1)[data.val_mask], data.y.squeeze(1)[data.val_mask])
 
-    elif args.subloss == 'loss_combine':
+    elif args.subloss == 'separate':
         loss1 = loss1.mean()
         loss2 = loss2.mean()
         loss = (loss1 * gating[data.val_mask] + loss2 * (1 - gating[data.val_mask])).mean()
@@ -1577,33 +1263,24 @@ def cal_val_loss_simple_gate(model1, model2, gate_model, data, crit, args):
     return loss.item(), gating.mean().item(), loss1.item(), loss2.item(), gating.cpu().numpy()
 
 
-def mowse_train_test_wrapper_simple_gate(args, model1, model2, gate_model, data, crit, optimizer1, optimizer2,
+def mowst_train_test_wrapper_simple_gate(args, model1, model2, gate_model, data, crit, optimizer1, optimizer2,
                                          split_idx, evaluator, device):
     big_epoch_check = 0
     big_best_score = 0
-    # big_best_loss = float('-inf')
+    
     n = len(data.y)
     df = pd.DataFrame({"id":list(range(n))})
 
 
     for j in range(args.big_epoch):
-        print('------ Big epoch {} Model 1 ------'.format(j))
-        model1_turn_val_acc = mowse_train_test_model1_turn_wrapper_simple_gate(args, model1, model2, gate_model, data,
+        print(f'------ Big epoch {j} Model 1 ------')
+        model1_turn_val_acc = mowst_train_test_model1_turn_wrapper_simple_gate(args, model1, model2, gate_model, data,
                                                                                crit, optimizer1,
                                                                                split_idx, evaluator, device,
                                                                                big_best_score)
-        # locals()[f"mlp_{j}_l1"] = loss1
-        # locals()[f"mlp_{j}_l2"] = loss2
-        # locals()[f"mlp_{j}_g"] = gating
-        # locals()[f"mlp_{j}_c"] = correct
-        # df.loc[:, f"mlp_{j}_l1"] = loss1
-        # df.loc[:, f"mlp_{j}_l2"] = loss2
-        # df.loc[:, f"mlp_{j}_g"] = gating
-        # df.loc[:, f"mlp_{j}_c"] = correct
-
-
-        print('------ Big epoch {} Model 2 ------'.format(j))
-        mowse_train_test_model2_turn_wrapper_simple_gate(args, model1, model2, gate_model, data, crit, optimizer2,
+    
+        print(f'------ Big epoch {j} Model 2 ------')
+        mowst_train_test_model2_turn_wrapper_simple_gate(args, model1, model2, gate_model, data, crit, optimizer2,
                                                          split_idx, evaluator, device,
                                                          model1_turn_val_acc)
 
@@ -1616,22 +1293,11 @@ def mowse_train_test_wrapper_simple_gate(args, model1, model2, gate_model, data,
             df.loc[:, "confidence"] = gating
             df.to_pickle(args.denoise_save_path + f"dataemb_{args.dataset}_{j}.pkl")
 
-        # locals()[f"gnn_{j}_l1"] = loss1
-        # locals()[f"gnn_{j}_l2"] = loss2
-        # locals()[f"gnn_{j}_g"] = gating
-        # locals()[f"gnn_{j}_c"] = correct
-
-        # df.loc[:, f"gnn_{j}_l1"] = loss1
-        # df.loc[:, f"gnn_{j}_l2"] = loss2
-        # df.loc[:, f"gnn_{j}_g"] = gating
-        # df.loc[:, f"gnn_{j}_c"] = correct
-
-        # df.to_pickle(args.denoise_save_path + f"denoise_{args.dataset}.pkl")
+        
 
 
-        result = test_mowse_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device)
-        # val_loss, VAL_LOSS, LOSS1, LOSS2 = loss_mowse_simple_gate(model1, model2, gate_model, data, crit, args)
-        # val_loss = - val_loss
+        result = test_mowst_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device)
+        
         log_conf = get_cur_confidence_simple_gate(args, gate_model, model1, data)
         if args.log:
             wandb.log({'Train Acc': result[0],
@@ -1641,36 +1307,26 @@ def mowse_train_test_wrapper_simple_gate(args, model1, model2, gate_model, data,
                        "Confidence Distribution": log_conf.cpu().numpy()
                        })
 
-        if args.no_early_stop is False:
-            # if val_loss > big_best_loss:
-            if result[1] > big_best_score:
-                big_epoch_check = 0
-                big_best_score = result[1]
-                # big_best_loss = val_loss
-                saved_model1_big = save_moe_model(args, model1, '1_big')
-                saved_model2_big = save_moe_model(args, model2, '2_big')
-            else:
-                big_epoch_check += 1
-                if big_epoch_check > args.big_patience:
-                    print("{} big epochs trained, best val acc {:.4f}".format(j, big_best_score))
-                    break
+        
+            
+        if result[1] > big_best_score:
+            big_epoch_check = 0
+            big_best_score = result[1]
+            
+            saved_model1_big = save_moe_model(args, model1, '1_big')
+            saved_model2_big = save_moe_model(args, model2, '2_big')
         else:
-            # if val_loss > big_best_loss:
-            if result[1] > big_best_score:
-                big_epoch_check = 0
-                big_best_score = result[1]
-                # big_best_loss = val_loss
-                saved_model1_big = save_moe_model(args, model1, '1_big')
-                saved_model2_big = save_moe_model(args, model2, '2_big')
+            big_epoch_check += 1
+            if big_epoch_check > args.big_patience:
+                print(f"{j} big epochs trained, best val acc {big_best_score:.4f}")
+                break
+        
 
     model1.load_state_dict(torch.load(saved_model1_big))
     model2.load_state_dict(torch.load(saved_model2_big))
-    result = test_mowse_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device)
+    result = test_mowst_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device)
     train_acc, val_acc, test_acc, model1_weight, _ = result
-    print('Final results: Train {:.2f} Val {:.2f} Test {:.2f} Model1 Weight {:.2f}'.format(train_acc * 100,
-                                                                                           val_acc * 100,
-                                                                                           test_acc * 100,
-                                                                                           model1_weight * 100))
+    print(f'Final results: Train {train_acc * 100:.2f} Val {val_acc * 100:.2f} Test {test_acc * 100:.2f} Model1 Weight {model1_weight * 100:.2f}')
     return result
 
 
@@ -1687,40 +1343,34 @@ def generate_embedding(args, model1, model2, gate_model, data):
         para2_model.eval()
         parabias2_model.eval()
     model1_out = model1(data)
-    model2_out, model2_emb = model2(data, mode=True)
-    if args.biased == 'logit':
-        if args.original_data == "true":
-            x = torch.cat((model1_out, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(x))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(model1_out))
-    elif args.biased == 'dispersion':
-        var_conf = compute_confidence(model1_out, "variance")
-        ent_conf = compute_confidence(model1_out, "entropy")
-        dispersion = torch.cat((var_conf, ent_conf), dim=1)
-        if args.original_data == "true":
-            gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(gate_input))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(dispersion))
-        elif args.original_data == "hypermlp":
-            node_feature = data.mlp_x
-            para1 = para1_model(node_feature)
-            parabias1 = parabias1_model(node_feature)
-            para2 = para2_model(node_feature)
-            parabias2 = parabias2_model(node_feature)
+    _, model2_emb = model2(data, mode=True)
+    
+    
+    var_conf = compute_confidence(model1_out, "variance")
+    ent_conf = compute_confidence(model1_out, "entropy")
+    dispersion = torch.cat((var_conf, ent_conf), dim=1)
+    if args.original_data == "true":
+        gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
+        gating = nn.Sigmoid()(gate_model(gate_input))
+    elif args.original_data == "false":
+        gating = nn.Sigmoid()(gate_model(dispersion))
+    elif args.original_data == "hypermlp":
+        node_feature = data.mlp_x
+        para1 = para1_model(node_feature)
+        parabias1 = parabias1_model(node_feature)
+        para2 = para2_model(node_feature)
+        parabias2 = parabias2_model(node_feature)
 
-            para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
-            dispersion = dispersion[:, np.newaxis, :]
-            para2 = para2[:, :, np.newaxis]
+        para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
+        dispersion = dispersion[:, np.newaxis, :]
+        para2 = para2[:, :, np.newaxis]
 
-            gating = torch.matmul(dispersion, para1)
-            gating += parabias1[:, np.newaxis, :]
-            gating = torch.matmul(gating, para2)
-            gating += parabias2[:, np.newaxis, :]
-            gating = nn.Sigmoid()(gating).view(-1, 1)
-    elif args.biased == 'none':
-        gating = nn.Sigmoid()(gate_model(data))
+        gating = torch.matmul(dispersion, para1)
+        gating += parabias1[:, np.newaxis, :]
+        gating = torch.matmul(gating, para2)
+        gating += parabias2[:, np.newaxis, :]
+        gating = nn.Sigmoid()(gating).view(-1, 1)
+    
 
     return model2_emb.cpu().numpy(), gating.view(-1).cpu().numpy()
 
@@ -1729,7 +1379,7 @@ def generate_embedding(args, model1, model2, gate_model, data):
 
 
 
-def mowse_train_test_model1_turn_wrapper_simple_gate(args, model1, model2, gate_model, data, crit, optimizer1,
+def mowst_train_test_model1_turn_wrapper_simple_gate(args, model1, model2, gate_model, data, crit, optimizer1,
                                                      split_idx, evaluator, device,
                                                      big_best_score):
     saved_model1_previous_big_turn = save_moe_model(args, model1, '1_big')
@@ -1737,13 +1387,11 @@ def mowse_train_test_model1_turn_wrapper_simple_gate(args, model1, model2, gate_
 
     check = 0
     best_score = 0
-    # best_loss = float('-inf')
     for i in range(args.epoch):
 
-        loss, l1, l2 = train_mowse1_simple_gate(model1, model2, gate_model, data, crit, optimizer1, args)
-        result = test_mowse_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device)
-        # val_loss = loss_mowse_simple_gate(model1, model2, gate_model, data, crit, args)
-        # val_loss = - val_loss
+        loss, l1, l2 = train_mowst1_simple_gate(model1, model2, gate_model, data, crit, optimizer1, args)
+        result = test_mowst_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device)
+        
         if args.log:
             wandb.log({'L1 train loss': l1.mean().item(),
                        "L1 train loss Distribution": l1.detach().cpu().numpy(),
@@ -1752,19 +1400,18 @@ def mowse_train_test_model1_turn_wrapper_simple_gate(args, model1, model2, gate_
                        })
 
         if i % args.print_freq == 0:
-            print('{} epochs trained, loss {:.4f}'.format(i, loss))
+            print(f'{i} epochs trained, loss {loss:.4f}')
 
-        # if val_loss > best_loss:
+        
         if result[1] > best_score:
             check = 0
-            # best_loss = val_loss
             best_score = result[1]
             saved_model1 = save_moe_model(args, model1, '1_inner')
             saved_model2 = save_moe_model(args, model2, '2_inner')
         else:
             check += 1
             if check > args.patience:
-                print("{} epochs trained, best val loss {:.4f}".format(i, best_score))
+                print(f"{i} epochs trained, best val loss {best_score:.4f}")
                 break
 
     if best_score > big_best_score:
@@ -1774,14 +1421,12 @@ def mowse_train_test_model1_turn_wrapper_simple_gate(args, model1, model2, gate_
         model1.load_state_dict(torch.load(saved_model1_previous_big_turn))
         model2.load_state_dict(torch.load(saved_model2_previous_big_turn))
 
-    # loss1, loss2, gating, correct = get_denoise_info(model1, model2, gate_model, data, crit, args, evaluator, split_idx, device)
-
     saved_model1 = save_moe_model(args, model1, 1)
     saved_model2 = save_moe_model(args, model2, 2)
     return max(best_score, big_best_score)
 
 
-def mowse_train_test_model2_turn_wrapper_simple_gate(args, model1, model2, gate_model, data, crit, optimizer2,
+def mowst_train_test_model2_turn_wrapper_simple_gate(args, model1, model2, gate_model, data, crit, optimizer2,
                                                      split_idx, evaluator, device,
                                                      model1_turn_val_acc):
     saved_model1_previous_small_turn = save_moe_model(args, model1, 1)
@@ -1789,14 +1434,11 @@ def mowse_train_test_model2_turn_wrapper_simple_gate(args, model1, model2, gate_
 
     check = 0
     best_score = 0
-    # best_loss = float('-inf')
     for i in range(args.epoch):
 
-        loss, l1, l2 = train_mowse2_simple_gate(model1, model2, gate_model, data, crit, optimizer2, args)
-        result = test_mowse_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device)
-        # val_loss = loss_mowse_simple_gate(model1, model2, gate_model, data, crit, args)
-        # val_loss = - val_loss
-
+        loss, l1, l2 = train_mowst2_simple_gate(model1, model2, gate_model, data, crit, optimizer2, args)
+        result = test_mowst_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device)
+        
         if args.log:
             wandb.log({'L1 train loss': l1.mean().item(),
                        "L1 train loss Distribution": l1.detach().cpu().numpy(),
@@ -1805,19 +1447,17 @@ def mowse_train_test_model2_turn_wrapper_simple_gate(args, model1, model2, gate_
                        })
 
         if i % args.print_freq == 0:
-            print('{} epochs trained, loss {:.4f}'.format(i, loss))
+            print(f'{i} epochs trained, loss {loss:.4f}')
 
-        # if val_loss > best_loss:
         if result[1] > best_score:
             check = 0
             best_score = result[1]
-            # best_loss = val_loss
             saved_model1 = save_moe_model(args, model1, '1_inner')
             saved_model2 = save_moe_model(args, model2, '2_inner')
         else:
             check += 1
             if check > args.patience:
-                print("{} epochs trained, best val acc {:.4f}".format(i, best_score))
+                print(f"{i} epochs trained, best val acc {best_score:.4f}")
                 break
     if best_score > model1_turn_val_acc:
         model1.load_state_dict(torch.load(saved_model1))
@@ -1825,11 +1465,10 @@ def mowse_train_test_model2_turn_wrapper_simple_gate(args, model1, model2, gate_
     else:
         model1.load_state_dict(torch.load(saved_model1_previous_small_turn))
         model2.load_state_dict(torch.load(saved_model2_previous_small_turn))
-    # loss1, loss2, gating, correct = get_denoise_info(model1, model2, gate_model, data, crit, args, evaluator, split_idx,
-    #                                                  device)
+
     saved_model1 = save_moe_model(args, model1, 1)
     saved_model2 = save_moe_model(args, model2, 2)
-    # return loss1, loss2, gating, correct
+    
 
 @torch.no_grad()
 def get_denoise_info(model1, model2, gate_model, data, crit, args, evaluator, split_idx, device):
@@ -1847,39 +1486,32 @@ def get_denoise_info(model1, model2, gate_model, data, crit, args, evaluator, sp
         parabias2_model.eval()
 
     model1_out = model1(data)
-    if args.biased == 'logit':
-        if args.original_data == "true":
-            x = torch.cat((model1_out, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(x))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(model1_out))
-    elif args.biased == 'dispersion':
-        var_conf = compute_confidence(model1_out, "variance")
-        ent_conf = compute_confidence(model1_out, "entropy")
-        dispersion = torch.cat((var_conf, ent_conf), dim=1)
-        if args.original_data == "true":
-            gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(gate_input))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(dispersion))
-        elif args.original_data == "hypermlp":
-            node_feature = data.mlp_x
-            para1 = para1_model(node_feature)
-            parabias1 = parabias1_model(node_feature)
-            para2 = para2_model(node_feature)
-            parabias2 = parabias2_model(node_feature)
+    
+    var_conf = compute_confidence(model1_out, "variance")
+    ent_conf = compute_confidence(model1_out, "entropy")
+    dispersion = torch.cat((var_conf, ent_conf), dim=1)
+    if args.original_data == "true":
+        gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
+        gating = nn.Sigmoid()(gate_model(gate_input))
+    elif args.original_data == "false":
+        gating = nn.Sigmoid()(gate_model(dispersion))
+    elif args.original_data == "hypermlp":
+        node_feature = data.mlp_x
+        para1 = para1_model(node_feature)
+        parabias1 = parabias1_model(node_feature)
+        para2 = para2_model(node_feature)
+        parabias2 = parabias2_model(node_feature)
 
-            para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
-            dispersion = dispersion[:, np.newaxis, :]
-            para2 = para2[:, :, np.newaxis]
+        para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
+        dispersion = dispersion[:, np.newaxis, :]
+        para2 = para2[:, :, np.newaxis]
 
-            gating = torch.matmul(dispersion, para1)
-            gating += parabias1[:, np.newaxis, :]
-            gating = torch.matmul(gating, para2)
-            gating += parabias2[:, np.newaxis, :]
-            gating = nn.Sigmoid()(gating).view(-1, 1)
-    elif args.biased == 'none':
-        gating = nn.Sigmoid()(gate_model(data))
+        gating = torch.matmul(dispersion, para1)
+        gating += parabias1[:, np.newaxis, :]
+        gating = torch.matmul(gating, para2)
+        gating += parabias2[:, np.newaxis, :]
+        gating = nn.Sigmoid()(gating).view(-1, 1)
+    
     with torch.no_grad():
         model2_out = model2(data)
 
@@ -1889,23 +1521,10 @@ def get_denoise_info(model1, model2, gate_model, data, crit, args, evaluator, sp
     else:
         raise ValueError('Invalid Crit found during training')
     gating = gating.view(-1)
-    loss = loss1 * gating + loss2 * (1 - gating)
-
-
+    _ = loss1 * gating + loss2 * (1 - gating)
 
     model1_out = F.softmax(model1_out, dim=1)
     model2_out = F.softmax(model2_out, dim=1)
-
-    if args.infer_method == 'simple':
-        train_acc, valid_acc, test_acc, model1_weight = eval_for_simplicity(evaluator, data, model1_out, model2_out,
-                                                                            gating, split_idx, args)
-        result = (train_acc, valid_acc, test_acc, model1_weight, float(0))
-    elif args.infer_method == 'multi':
-        train_acc, valid_acc, test_acc, model1_weight = eval_for_multi(args, gating, device, model1_out, model2_out,
-                                                                       evaluator, data, split_idx)
-        result = (train_acc, valid_acc, test_acc, model1_weight, float(0))
-
-
 
     m = torch.rand(gating.shape).to(device)
     gate = (m < gating).int().view(-1, 1)
@@ -1916,17 +1535,11 @@ def get_denoise_info(model1, model2, gate_model, data, crit, args, evaluator, sp
     y_pred = y_pred.view(-1, 1)
     correct = (y_pred == data.y).view(-1).float()
 
-
-
     return loss1.cpu().numpy(), loss2.cpu().numpy(), gating.cpu().numpy(), correct.cpu().numpy()
 
 
 
-
-
-
-
-def train_mowse1_simple_gate(model1, model2, gate_model, data, crit, optimizer1, args):
+def train_mowst1_simple_gate(model1, model2, gate_model, data, crit, optimizer1, args):
     model1.train()
     model2.train()
     if args.original_data != "hypermlp":
@@ -1939,39 +1552,32 @@ def train_mowse1_simple_gate(model1, model2, gate_model, data, crit, optimizer1,
         parabias2_model.train()
     optimizer1.zero_grad()
     model1_out = model1(data)
-    if args.biased == 'logit':
-        if args.original_data == "true":
-            x = torch.cat((model1_out, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(x))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(model1_out))
-    elif args.biased == 'dispersion':
-        var_conf = compute_confidence(model1_out, "variance")
-        ent_conf = compute_confidence(model1_out, "entropy")
-        dispersion = torch.cat((var_conf, ent_conf), dim=1)
-        if args.original_data == "true":
-            gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(gate_input))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(dispersion))
-        elif args.original_data == "hypermlp":
-            node_feature = data.mlp_x
-            para1 = para1_model(node_feature)
-            parabias1 = parabias1_model(node_feature)
-            para2 = para2_model(node_feature)
-            parabias2 = parabias2_model(node_feature)
 
-            para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
-            dispersion = dispersion[:, np.newaxis, :]
-            para2 = para2[:, :, np.newaxis]
+    var_conf = compute_confidence(model1_out, "variance")
+    ent_conf = compute_confidence(model1_out, "entropy")
+    dispersion = torch.cat((var_conf, ent_conf), dim=1)
+    if args.original_data == "true":
+        gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
+        gating = nn.Sigmoid()(gate_model(gate_input))
+    elif args.original_data == "false":
+        gating = nn.Sigmoid()(gate_model(dispersion))
+    elif args.original_data == "hypermlp":
+        node_feature = data.mlp_x
+        para1 = para1_model(node_feature)
+        parabias1 = parabias1_model(node_feature)
+        para2 = para2_model(node_feature)
+        parabias2 = parabias2_model(node_feature)
 
-            gating = torch.matmul(dispersion, para1)
-            gating += parabias1[:, np.newaxis, :]
-            gating = torch.matmul(gating, para2)
-            gating += parabias2[:, np.newaxis, :]
-            gating = nn.Sigmoid()(gating).view(-1, 1)
-    elif args.biased == 'none':
-        gating = nn.Sigmoid()(gate_model(data))
+        para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
+        dispersion = dispersion[:, np.newaxis, :]
+        para2 = para2[:, :, np.newaxis]
+
+        gating = torch.matmul(dispersion, para1)
+        gating += parabias1[:, np.newaxis, :]
+        gating = torch.matmul(gating, para2)
+        gating += parabias2[:, np.newaxis, :]
+        gating = nn.Sigmoid()(gating).view(-1, 1)
+    
     with torch.no_grad():
         model2_out = model2(data)
 
@@ -1987,7 +1593,7 @@ def train_mowse1_simple_gate(model1, model2, gate_model, data, crit, optimizer1,
     return loss.mean().item(), loss1, loss2
 
 
-def train_mowse2_simple_gate(model1, model2, gate_model, data, crit, optimizer2, args):
+def train_mowst2_simple_gate(model1, model2, gate_model, data, crit, optimizer2, args):
     model1.train()
     model2.train()
     if args.original_data != "hypermlp":
@@ -2003,39 +1609,32 @@ def train_mowse2_simple_gate(model1, model2, gate_model, data, crit, optimizer2,
 
     with torch.no_grad():
         model1_out = model1(data)
-        if args.biased == "logit":
-            if args.original_data == "true":
-                x = torch.cat((model1_out, data.mlp_x), dim=1)
-                gating = nn.Sigmoid()(gate_model(x))
-            elif args.original_data == "false":
-                gating = nn.Sigmoid()(gate_model(model1_out))
-        elif args.biased == 'dispersion':
-            var_conf = compute_confidence(model1_out, "variance")
-            ent_conf = compute_confidence(model1_out, "entropy")
-            dispersion = torch.cat((var_conf, ent_conf), dim=1)
-            if args.original_data == "true":
-                gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
-                gating = nn.Sigmoid()(gate_model(gate_input))
-            elif args.original_data == "false":
-                gating = nn.Sigmoid()(gate_model(dispersion))
-            elif args.original_data == "hypermlp":
-                node_feature = data.mlp_x
-                para1 = para1_model(node_feature)
-                parabias1 = parabias1_model(node_feature)
-                para2 = para2_model(node_feature)
-                parabias2 = parabias2_model(node_feature)
+        
+        var_conf = compute_confidence(model1_out, "variance")
+        ent_conf = compute_confidence(model1_out, "entropy")
+        dispersion = torch.cat((var_conf, ent_conf), dim=1)
+        if args.original_data == "true":
+            gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
+            gating = nn.Sigmoid()(gate_model(gate_input))
+        elif args.original_data == "false":
+            gating = nn.Sigmoid()(gate_model(dispersion))
+        elif args.original_data == "hypermlp":
+            node_feature = data.mlp_x
+            para1 = para1_model(node_feature)
+            parabias1 = parabias1_model(node_feature)
+            para2 = para2_model(node_feature)
+            parabias2 = parabias2_model(node_feature)
 
-                para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
-                dispersion = dispersion[:, np.newaxis, :]
-                para2 = para2[:, :, np.newaxis]
+            para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
+            dispersion = dispersion[:, np.newaxis, :]
+            para2 = para2[:, :, np.newaxis]
 
-                gating = torch.matmul(dispersion, para1)
-                gating += parabias1[:, np.newaxis, :]
-                gating = torch.matmul(gating, para2)
-                gating += parabias2[:, np.newaxis, :]
-                gating = nn.Sigmoid()(gating).view(-1, 1)
-        elif args.biased == "none":
-            gating = nn.Sigmoid()(gate_model(data))
+            gating = torch.matmul(dispersion, para1)
+            gating += parabias1[:, np.newaxis, :]
+            gating = torch.matmul(gating, para2)
+            gating += parabias2[:, np.newaxis, :]
+            gating = nn.Sigmoid()(gating).view(-1, 1)
+        
 
     if crit.__class__.__name__ == 'NLLLoss':
         loss1 = crit(F.log_softmax(model1_out, dim=1)[data.train_mask], data.y.squeeze(1)[data.train_mask])
@@ -2051,7 +1650,7 @@ def train_mowse2_simple_gate(model1, model2, gate_model, data, crit, optimizer2,
 
 
 @torch.no_grad()
-def loss_mowse_simple_gate(model1, model2, gate_model, data, crit, args):
+def loss_mowst_simple_gate(model1, model2, gate_model, data, crit, args):
     model1.eval()
     model2.eval()
     if args.original_data != "hypermlp":
@@ -2063,39 +1662,32 @@ def loss_mowse_simple_gate(model1, model2, gate_model, data, crit, args):
         para2_model.eval()
         parabias2_model.eval()
     model1_out = model1(data)
-    if args.biased == 'logit':
-        if args.original_data == "true":
-            x = torch.cat((model1_out, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(x))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(model1_out))
-    elif args.biased == 'dispersion':
-        var_conf = compute_confidence(model1_out, "variance")
-        ent_conf = compute_confidence(model1_out, "entropy")
-        dispersion = torch.cat((var_conf, ent_conf), dim=1)
-        if args.original_data == "true":
-            gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(gate_input))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(dispersion))
-        elif args.original_data == "hypermlp":
-            node_feature = data.mlp_x
-            para1 = para1_model(node_feature)
-            parabias1 = parabias1_model(node_feature)
-            para2 = para2_model(node_feature)
-            parabias2 = parabias2_model(node_feature)
+    
+    var_conf = compute_confidence(model1_out, "variance")
+    ent_conf = compute_confidence(model1_out, "entropy")
+    dispersion = torch.cat((var_conf, ent_conf), dim=1)
+    if args.original_data == "true":
+        gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
+        gating = nn.Sigmoid()(gate_model(gate_input))
+    elif args.original_data == "false":
+        gating = nn.Sigmoid()(gate_model(dispersion))
+    elif args.original_data == "hypermlp":
+        node_feature = data.mlp_x
+        para1 = para1_model(node_feature)
+        parabias1 = parabias1_model(node_feature)
+        para2 = para2_model(node_feature)
+        parabias2 = parabias2_model(node_feature)
 
-            para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
-            dispersion = dispersion[:, np.newaxis, :]
-            para2 = para2[:, :, np.newaxis]
+        para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
+        dispersion = dispersion[:, np.newaxis, :]
+        para2 = para2[:, :, np.newaxis]
 
-            gating = torch.matmul(dispersion, para1)
-            gating += parabias1[:, np.newaxis, :]
-            gating = torch.matmul(gating, para2)
-            gating += parabias2[:, np.newaxis, :]
-            gating = nn.Sigmoid()(gating).view(-1, 1)
-    elif args.biased == 'none':
-        gating = nn.Sigmoid()(gate_model(data))
+        gating = torch.matmul(dispersion, para1)
+        gating += parabias1[:, np.newaxis, :]
+        gating = torch.matmul(gating, para2)
+        gating += parabias2[:, np.newaxis, :]
+        gating = nn.Sigmoid()(gating).view(-1, 1)
+    
     with torch.no_grad():
         model2_out = model2(data)
 
@@ -2111,7 +1703,7 @@ def loss_mowse_simple_gate(model1, model2, gate_model, data, crit, args):
 
 
 @torch.no_grad()
-def test_mowse_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device):
+def test_mowst_simple_gate(model1, model2, gate_model, data, split_idx, evaluator, args, device):
     model1.eval()
     model2.eval()
     if args.original_data != "hypermlp":
@@ -2124,13 +1716,63 @@ def test_mowse_simple_gate(model1, model2, gate_model, data, split_idx, evaluato
         parabias2_model.eval()
     model1_out = model1(data)
     model2_out = model2(data)
-    if args.biased == 'logit':
-        if args.original_data == "true":
-            x = torch.cat((model1_out, data.mlp_x), dim=1)
-            gating = nn.Sigmoid()(gate_model(x))
-        elif args.original_data == "false":
-            gating = nn.Sigmoid()(gate_model(model1_out))
-    elif args.biased == 'dispersion':
+    
+    
+    var_conf = compute_confidence(model1_out, "variance")
+    ent_conf = compute_confidence(model1_out, "entropy")
+    dispersion = torch.cat((var_conf, ent_conf), dim=1)
+    if args.original_data == "true":
+        gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
+        gating = nn.Sigmoid()(gate_model(gate_input))
+    elif args.original_data == "false":
+        gating = nn.Sigmoid()(gate_model(dispersion))
+    elif args.original_data == "hypermlp":
+        node_feature = data.mlp_x
+        para1 = para1_model(node_feature)
+        parabias1 = parabias1_model(node_feature)
+        para2 = para2_model(node_feature)
+        parabias2 = parabias2_model(node_feature)
+
+        para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
+        dispersion = dispersion[:, np.newaxis, :]
+        para2 = para2[:, :, np.newaxis]
+
+        gating = torch.matmul(dispersion, para1)
+        gating += parabias1[:, np.newaxis, :]
+        gating = torch.matmul(gating, para2)
+        gating += parabias2[:, np.newaxis, :]
+        gating = nn.Sigmoid()(gating).view(-1, 1)
+    
+
+    model1_out = F.softmax(model1_out, dim=1)
+    model2_out = F.softmax(model2_out, dim=1)
+
+    if args.infer_method == 'simple':
+        train_acc, valid_acc, test_acc, model1_weight = eval_for_simplicity(evaluator, data, model1_out, model2_out,
+                                                                            gating, split_idx, args)
+        return train_acc, valid_acc, test_acc, model1_weight, float(0)
+    elif args.infer_method == 'multi':
+        train_acc, valid_acc, test_acc, model1_weight = eval_for_multi(args, gating, device, model1_out, model2_out,
+                                                                       evaluator, data, split_idx)
+        return train_acc, valid_acc, test_acc, model1_weight, float(0)
+
+    
+
+
+@torch.no_grad()
+def get_cur_confidence_simple_gate(args, gate_model, model1, data):
+    if args.original_data != "hypermlp":
+        gate_model.eval()
+    else:
+        para1_model, parabias1_model, para2_model, parabias2_model = gate_model
+        para1_model.eval()
+        parabias1_model.eval()
+        para2_model.eval()
+        parabias2_model.eval()
+    model1.eval()
+    with torch.no_grad():
+        
+        model1_out = model1(data)
         var_conf = compute_confidence(model1_out, "variance")
         ent_conf = compute_confidence(model1_out, "entropy")
         dispersion = torch.cat((var_conf, ent_conf), dim=1)
@@ -2155,71 +1797,5 @@ def test_mowse_simple_gate(model1, model2, gate_model, data, split_idx, evaluato
             gating = torch.matmul(gating, para2)
             gating += parabias2[:, np.newaxis, :]
             gating = nn.Sigmoid()(gating).view(-1, 1)
-    elif args.biased == 'none':
-        gating = nn.Sigmoid()(gate_model(data))
-
-    model1_out = F.softmax(model1_out, dim=1)
-    model2_out = F.softmax(model2_out, dim=1)
-
-    if args.infer_method == 'simple':
-        train_acc, valid_acc, test_acc, model1_weight = eval_for_simplicity(evaluator, data, model1_out, model2_out,
-                                                                            gating, split_idx, args)
-        return train_acc, valid_acc, test_acc, model1_weight, float(0)
-    elif args.infer_method == 'multi':
-        train_acc, valid_acc, test_acc, model1_weight = eval_for_multi(args, gating, device, model1_out, model2_out,
-                                                                       evaluator, data, split_idx)
-        return train_acc, valid_acc, test_acc, model1_weight, float(0)
-
-    # train_acc, valid_acc, test_acc, model1_weight = eval_for_multi(args, gating, device, model1_out, model2_out,
-    #                                                                evaluator, data, split_idx)
-    # return train_acc, valid_acc, test_acc, model1_weight, float(0)
-
-
-@torch.no_grad()
-def get_cur_confidence_simple_gate(args, gate_model, model1, data):
-    if args.original_data != "hypermlp":
-        gate_model.eval()
-    else:
-        para1_model, parabias1_model, para2_model, parabias2_model = gate_model
-        para1_model.eval()
-        parabias1_model.eval()
-        para2_model.eval()
-        parabias2_model.eval()
-    model1.eval()
-    with torch.no_grad():
-        if args.biased == 'logit':
-            model1_out = model1(data)
-            if args.original_data == "true":
-                x = torch.cat((model1_out, data.mlp_x), dim=1)
-                gating = nn.Sigmoid()(gate_model(x))
-            elif args.original_data == "false":
-                gating = nn.Sigmoid()(gate_model(model1_out))
-        elif args.biased == 'dispersion':
-            model1_out = model1(data)
-            var_conf = compute_confidence(model1_out, "variance")
-            ent_conf = compute_confidence(model1_out, "entropy")
-            dispersion = torch.cat((var_conf, ent_conf), dim=1)
-            if args.original_data == "true":
-                gate_input = torch.cat((dispersion, data.mlp_x), dim=1)
-                gating = nn.Sigmoid()(gate_model(gate_input))
-            elif args.original_data == "false":
-                gating = nn.Sigmoid()(gate_model(dispersion))
-            elif args.original_data == "hypermlp":
-                node_feature = data.mlp_x
-                para1 = para1_model(node_feature)
-                parabias1 = parabias1_model(node_feature)
-                para2 = para2_model(node_feature)
-                parabias2 = parabias2_model(node_feature)
-
-                para1 = para1.reshape(-1, 2, args.model1_hidden_dim)
-                dispersion = dispersion[:, np.newaxis, :]
-                para2 = para2[:, :, np.newaxis]
-
-                gating = torch.matmul(dispersion, para1)
-                gating += parabias1[:, np.newaxis, :]
-                gating = torch.matmul(gating, para2)
-                gating += parabias2[:, np.newaxis, :]
-                gating = nn.Sigmoid()(gating).view(-1, 1)
-        elif args.biased == 'none':
-            gating = nn.Sigmoid()(gate_model(data))
+    
     return gating.view(-1)
