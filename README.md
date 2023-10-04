@@ -1,4 +1,4 @@
-Example commands
+### Example commands
 
 1. run vanilla GCN on flickr, one run
 ```
