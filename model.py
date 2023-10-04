@@ -37,16 +37,31 @@ class GCN(torch.nn.Module):
         for bn in self.bns:
             bn.reset_parameters()
 
-    def forward(self, data):
+    def forward(self, data, mode=None):
         x, adj_t = data.x, data.adj_t
-        for i, conv in enumerate(self.convs[:-1]):
-            x = conv(x, adj_t)
-            if self.args.no_batch_norm is False:
-                x = self.bns[i](x)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        x_final = self.convs[-1](x, adj_t)
-        return x_final
+        if not mode:
+            for i, conv in enumerate(self.convs[:-1]):
+                x = conv(x, adj_t)
+                if self.args.no_batch_norm is False:
+                    x = self.bns[i](x)
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+            x_final = self.convs[-1](x, adj_t)
+            return x_final
+        else:
+            for i, conv in enumerate(self.convs[:-2]):
+                x = conv(x, adj_t)
+                if self.args.no_batch_norm is False:
+                    x = self.bns[i](x)
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+            x = self.convs[-2](x, adj_t)
+
+
+            x_last2final = F.relu(x)
+            x_last2final = F.dropout(x_last2final, p=self.dropout, training=self.training)
+            x_final = self.convs[-1](x_last2final, adj_t)
+            return x_final, x
 
 
 class Sage(torch.nn.Module):
