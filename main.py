@@ -34,7 +34,7 @@ if __name__ == '__main__':
         # choose how to make the inference
         # joint for Mowst-*
         # multi for Mowst
-    parser.add_argument('--model1', type=str, default='MLP', choices=["MLP", "GCN", "Sage"]
+    parser.add_argument('--model1', type=str, default='MLP', choices=["MLP", "GCN", "Sage"],
                         help="choose the model arch for model 1")
         # for the comparison between the weak-strong and strong-strong settings, we can set model 1 the same as model 2
     parser.add_argument('--model2', type=str, default='GCN', choices=["MLP","GCN","GAT","GIN"
