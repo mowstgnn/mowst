@@ -19,7 +19,7 @@ if __name__ == '__main__':
     parser.add_argument("--setting", type=str, default="exp", choices=["exp", "ten"], help='decide experiment settings')
         # exp: single run
         # ten: ten run for homophily graphs, five run for heterophily graphs; including grid searh
-    parser.add_argument("--method", type=str, default="baseline", choices=["baseline", "mowst_star", "mowst"], huelp="choose methods")
+    parser.add_argument("--method", type=str, default="baseline", choices=["baseline", "mowst_star", "mowst"], help="choose methods")
         # baseline: MLP, GCN, GAT, GIN, GraphSage, GPR-GNN, AdaGCN, GraphMoE-GCN, GraphMoE-Sage, use --model2 to specify the exact baselien
         # mowst_star: Mowst-*
         # mowst: Mowst
