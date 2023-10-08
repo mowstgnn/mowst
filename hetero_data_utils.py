@@ -385,8 +385,7 @@ def load_hetero_data(args):
     # infer the number of classes for non one-hot and one-hot labels
     c = max(raw_dataset.label.max().item() + 1, raw_dataset.label.shape[1])
     d = raw_dataset.graph['node_feat'].shape[1]
-    if not args.directed and dataset_name != 'ogbn-proteins':
-        raw_dataset.graph['edge_index'] = to_undirected(raw_dataset.graph['edge_index'])
+    
 
     data = Data(x=raw_dataset.graph['node_feat'], edge_index=raw_dataset.graph['edge_index'])
     if args.model2 != "GPR-GNN" and args.model2 != "adagcn":
