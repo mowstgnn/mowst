@@ -1151,42 +1151,21 @@ def simple_gate_train_test_wrapper(args, model1, model2, gate_model, data, crit,
         if i % args.print_freq == 0:
             print(f'{i} epochs trained, loss {loss:.4f}')
 
-        if args.no_early_stop is False:
-
-            if val_loss > best_loss:
-                check = 0
-                best_score = result[1]
-                best_loss = val_loss
-                saved_model1 = save_model(args, model1, 'model1')
-                saved_model2 = save_model(args, model2, 'model2')
-                if args.original_data != "hypermlp":
-                    saved_gate_model = save_model(args, gate_model, 'gate_model')
-                else:
-                    para1_model, parabias1_model, para2_model, parabias2_model = gate_model
-                    saved_para1_model = save_model(args, para1_model, 'para1_model')
-                    save_parabias1_model = save_model(args, parabias1_model, 'parabias1_model')
-                    saved_para2_model = save_model(args, para2_model, 'para2_model')
-                    save_parabias2_model = save_model(args, parabias2_model, 'parabias2_model')
+        
+        if val_loss > best_loss:
+            check = 0
+            best_score = result[1]
+            best_loss = val_loss
+            saved_model1 = save_model(args, model1, 'model1')
+            saved_model2 = save_model(args, model2, 'model2')
+            if args.original_data != "hypermlp":
+                saved_gate_model = save_model(args, gate_model, 'gate_model')
             else:
-                check += 1
-                if check > args.patience:
-                    print(f"{i} epochs trained, best val loss {-best_loss:.4f}")
-                    break
-        else:
-            if val_loss > best_loss:
-                check = 0
-                best_score = result[1]
-                best_loss = val_loss
-                saved_model1 = save_model(args, model1, 'model1')
-                saved_model2 = save_model(args, model2, 'model2')
-                if args.original_data != "hypermlp":
-                    saved_gate_model = save_model(args, gate_model, 'gate_model')
-                else:
-                    para1_model, parabias1_model, para2_model, parabias2_model = gate_model
-                    saved_para1_model = save_model(args, para1_model, 'para1_model')
-                    save_parabias1_model = save_model(args, parabias1_model, 'parabias1_model')
-                    saved_para2_model = save_model(args, para2_model, 'para2_model')
-                    save_parabias2_model = save_model(args, parabias2_model, 'parabias2_model')
+                para1_model, parabias1_model, para2_model, parabias2_model = gate_model
+                saved_para1_model = save_model(args, para1_model, 'para1_model')
+                save_parabias1_model = save_model(args, parabias1_model, 'parabias1_model')
+                saved_para2_model = save_model(args, para2_model, 'para2_model')
+                save_parabias2_model = save_model(args, parabias2_model, 'parabias2_model')
 
     model1.load_state_dict(torch.load(saved_model1))
     model2.load_state_dict(torch.load(saved_model2))
