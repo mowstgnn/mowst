@@ -14,6 +14,7 @@ import torch
 import numpy as np
 import random
 import torch_geometric.transforms as T
+from hetero_data_utils import load_hetero_data
 
 
 # initialize the experiment (e.g., creating directories to save results)
