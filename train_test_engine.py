@@ -1263,14 +1263,14 @@ def mowst_train_test_wrapper_simple_gate(args, model1, model2, gate_model, data,
                                                          split_idx, evaluator, device,
                                                          model1_turn_val_acc)
 
-        if j % 1 == 0:
-            model2_emb, gating = generate_embedding(args, model1, model2, gate_model, data)
+        # if j % 1 == 0:
+        #     model2_emb, gating = generate_embedding(args, model1, model2, gate_model, data)
 
 
-            ncol = model2_emb.shape[1]
-            df = pd.DataFrame(data=model2_emb, columns=[f"col{_}" for _ in range(ncol)])
-            df.loc[:, "confidence"] = gating
-            df.to_pickle(args.denoise_save_path + f"dataemb_{args.dataset}_{j}.pkl")
+        #     ncol = model2_emb.shape[1]
+        #     df = pd.DataFrame(data=model2_emb, columns=[f"col{_}" for _ in range(ncol)])
+        #     df.loc[:, "confidence"] = gating
+        #     df.to_pickle(args.denoise_save_path + f"dataemb_{args.dataset}_{j}.pkl")
 
         
 
